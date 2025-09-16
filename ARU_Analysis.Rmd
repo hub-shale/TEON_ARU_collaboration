@@ -1,0 +1,22 @@
+---
+title: "ARU Analysis"
+output: html_document
+date: "2025-09-16"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+# import libraries
+library(tidyverse)
+library(ggplot2)
+library(vegan)
+```
+
+```{r}
+load_data = read.csv("")
+```
+
