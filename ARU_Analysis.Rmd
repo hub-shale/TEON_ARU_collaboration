@@ -19,6 +19,260 @@ library(gitcreds)
 
 ```{r DataLoad}
 # data load
-load_data = read.csv("")
+PCdata_raw <- read.csv("data_raw/PointCountresults.csv")
+ARUdata_raw <- read.csv("data_raw/ARUXHumanresults.csv")
+BRDdata_raw <- read.csv("data_raw/Birdnetresults.csv")
+
+# Save as rds
+saveRDS(PCdata_raw, "data/PC_data.rds")
+saveRDS(ARUdata_raw, "data/ARUxHuman_data.rds")
+saveRDS(BRDdata_raw, "data/BirdNet_data.rds")
+
+# Load rds
+PC_data <- readRDS("data/PC_data.rds")
+ARUxHuman_data <- readRDS("data/ARUxHuman_data.rds")
+BirdNet_data <- readRDS("data/BirdNet_data.rds")
+
 ```
 
+
+```{r Wrangling}
+
+#Clean up Point Counts
+clean_PC_data <- PC_data |>
+  janitor::clean_names() |>
+  mutate(
+    date = as.Date(date),
+    presence = 1,
+    method = "Point Count",
+  ) |>
+  select(site, date, start_time, species_code, presence, method, aru_match)
+
+
+#Clean up ARU with Human Listener
+clean_ARUxHuman_data = ARUxHuman_data |>
+  janitor::clean_names() |>
+  mutate(
+    # make sure date is Date class
+    date = as.Date(date, format = "%m/%d/%Y"),
+    presence = 1,
+    method = "ARUxHuman",
+  ) |>
+  select(site, date, start_time, species_code, presence, method, pc_match)
+
+
+#Clean up BirdNet Results
+clean_BirdNet_data = BirdNet_data |>
+  janitor::clean_names() |>
+  mutate(
+    # make sure date is Date class
+    date = as.Date(date, format = "%m/%d/%Y"),
+    presence = 1,
+    method = "ARUxBirdNet",
+  ) |>
+  select(site, date, start_time, common_name, species_code, presence, confidence, method, aru_match)
+
+
+#Combine into one dataframe
+all_obs <- bind_rows(
+  clean_PC_data,
+  clean_ARUxHuman_data,
+  clean_BirdNet_data
+)
+
+#Reorder columns to a nicer order
+all_obs <- all_obs |>
+  select(
+    site,
+    date,
+    start_time,
+    common_name,
+    species_code,
+    presence,
+    confidence,
+    method,
+    pc_match,
+    aru_match,
+  )
+
+```
+
+
+## Matching Point Count and ARU Recording Comparisons
+```{r Create Matching Dataset}
+
+##Creating subset of observations with matching Point Count, ARUxHuman, and Birdnet files. Convoluted code because of the variability in start times for Point Counts especially for aquatic sites.
+#Convert start time to minutes to avoid errors when matching later
+aru_anchors <- clean_ARUxHuman_data %>%
+  mutate(
+    start_dt  = hm(start_time),
+    start_min = hour(start_dt)*60 + minute(start_dt),
+    # define event_id for each unique "counting event"
+    event_id  = paste(site, date, start_min, sep = "_")
+  )
+
+#filter to only rows in birdnet data with a matching ARUxhuman file
+bn_candidates <- clean_BirdNet_data %>%
+  # only rows that have aru_match == "Y" 
+  filter(!is.na(aru_match) & aru_match == "Y") %>%
+  mutate(
+    start_dt  = hm(start_time),
+    start_min = hour(start_dt)*60 + minute(start_dt),
+    bn_row_id = row_number()   
+  )
+
+
+#Add start_min to PC data and create time tolerance framework for matching with an ARU file. (Within 3 minutes for terrestrial sites. Within 5 minutes for 2 accidental counts added outside of this rule. Within 15 minutes for aquatic sites as those are 20 minute long counts)
+pc_candidates <- clean_PC_data %>%
+  mutate(
+    pc_row_id = row_number(),  # unique ID for each PC row
+    start_dt = lubridate::hm(start_time),
+    start_min = hour(start_dt) * 60 + minute(start_dt),
+    tolerance = case_when(
+      site %in% c("L76", "M295") ~ 5,
+      site == "U34"              ~ 15,
+      str_detect(site, "^[A-Z]{3}$") ~ 15,
+      TRUE ~ 3
+    )
+  )
+
+# Match BirdNet candidates to ARUxHuman anchors 
+# inner_join by site+date to avoid a huge full cross-join
+bn_matches <- bn_candidates %>%
+  inner_join(
+    aru_anchors %>% select(site, date, human_start_min = start_min, event_id),
+    by = c("site", "date")
+  ) %>%
+  mutate(time_diff = abs(start_min - human_start_min)) %>%
+  filter(time_diff <= 1) %>%            # ±1 minute rule for ARUxBirdNet -> ARUxHuman, should all have the exact same start time so may not be necessary
+  group_by(bn_row_id) %>%
+  slice_min(time_diff, with_ties = FALSE) %>%  # if multiple anchors, keep closest
+  ungroup()
+
+
+# attach event_id back to the original bn rows, keep only matched ones
+birdnet_subset <- bn_candidates %>%
+  left_join(bn_matches %>% select(bn_row_id, event_id), by = "bn_row_id") %>%
+  filter(!is.na(event_id)) %>%
+  select(-bn_row_id)
+
+# Match Point Counts to ARUxHuman anchors 
+pc_matches <- pc_candidates %>%
+  inner_join(
+    aru_anchors %>% select(site, date, human_start_min = start_min, event_id),
+    by = c("site", "date")
+  ) %>%
+  mutate(time_diff = abs(start_min - human_start_min)) %>%
+  # keep only where time_diff <= the site's tolerance
+  filter(time_diff <= tolerance) %>%
+  group_by(pc_row_id) %>%
+  slice_min(time_diff, with_ties = FALSE) %>%  
+  ungroup()
+
+pc_subset <- pc_candidates %>%
+  left_join(pc_matches %>% select(pc_row_id, event_id), by = "pc_row_id") %>%
+  filter(!is.na(event_id)) %>%
+  select(-pc_row_id, -tolerance)
+
+# Combine all three methods back into one to create full matching subset of data
+all_obs_matched <- bind_rows(
+  aru_anchors,
+  birdnet_subset,
+  pc_subset
+) %>%
+  select(
+    site, date, start_time, common_name, species_code, presence, confidence,
+    method, pc_match, aru_match, event_id
+  ) %>%
+  distinct()  
+
+```
+
+1)  Richness - number of species per count between methods
+```{r}
+
+##Counting events with all 3 methods
+# pick only events where the ARUxHuman anchor has pc_match == "Y"
+events_with_pcY <- aru_anchors %>%
+  filter(!is.na(pc_match) & pc_match == "Y") %>%
+  pull(event_id) %>%
+  unique()
+
+all_obs_PC_matches <- all_obs_matched %>%
+  filter(event_id %in% events_with_pcY) %>%
+  mutate(
+    species_id = coalesce(species_code, common_name) #no species codes for non-birds and birds not in North America from birdnet data so add common name for those
+  )
+
+# species richness per counting event for each method (long)
+richness_summary <- all_obs_PC_matches %>%
+  group_by(site, date, event_id, method) %>%
+  summarise(richness = n_distinct(species_id), .groups = "drop")
+
+# wide table
+richness_wide <- richness_summary %>%
+  pivot_wider(names_from = method,
+              values_from = richness,
+              values_fill = 0)
+
+#average species richness for each method
+avg_richness <- richness_summary %>%
+  group_by(method) %>%
+  summarise(
+    mean_richness = mean(richness),
+    sd_val = sd(richness),
+    .groups = "drop"
+  )
+
+#bar graph of average species richness with standard deviation
+ggplot(avg_richness, aes(x = method, y = mean_richness, fill = method)) +
+  geom_col(width = 0.6, show.legend = FALSE) +
+  geom_errorbar(aes(ymin = mean_richness - sd_val, ymax = mean_richness + sd_val),
+                width = 0.2, linewidth = 0.7) +
+  labs(
+    title = "Average Species Richness by Method (± SD)",
+    x = "Method",
+    y = "Average Richness"
+  ) +
+  theme_minimal(base_size = 14)
+
+
+```
+Birdnet has a much lower average number of species detected for any given 10 minute counting segment. This is at the 50% confidence level and is including non-birds (eg frogs, engine nosies, etc) and the full list of worldwide bird species with no filtering. The gap between Birdnet and human counts would only increase if you increased the confidence threshold or filtered out improbable species.
+
+```{r}
+#Boxplot of species richness per method
+ggplot(richness_summary, aes(x = method, y = richness, fill = method)) +
+  geom_boxplot(alpha = 0.7) +
+  geom_jitter(width = 0.2, alpha = 0.3) +
+  labs(
+    title = "Distribution of Species Richness per Method",
+    x = "Method",
+    y = "Richness"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(legend.position = "none")
+
+```
+```{r}
+#Species counts for each counting event faceted by site for readability.
+ggplot(richness_summary, aes(x = event_id, y = richness, fill = method)) +
+  geom_col(position = "dodge") +
+  facet_wrap(~ site, scales = "free_x") +
+  labs(
+    title = "Species Richness by Method at Each Count (Faceted by Site)",
+    x = "Event ID",
+    y = "Richness"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    axis.text.x = element_blank(),
+    axis.ticks.x = element_blank(),
+    panel.grid.major.x = element_blank()
+  )
+
+```
+
+2. Omission/Comission Analysis
+
+What to do about non-birds/ extremely unlikely birds (eg birds from Asia,Africa,etc) in Birdnet data. Should we filter first before running this analysis?
