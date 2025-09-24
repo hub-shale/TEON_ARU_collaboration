@@ -191,7 +191,7 @@ all_obs_matched <- bind_rows(
 1)  Richness - number of species per count between methods
 ```{r}
 
-##Counting events with all 3 methods
+## Filtering to counting events with all 3 methods
 # pick only events where the ARUxHuman anchor has pc_match == "Y"
 events_with_pcY <- aru_anchors %>%
   filter(!is.na(pc_match) & pc_match == "Y") %>%
@@ -254,6 +254,8 @@ ggplot(richness_summary, aes(x = method, y = richness, fill = method)) +
   theme(legend.position = "none")
 
 ```
+
+
 ```{r}
 #Species counts for each counting event faceted by site for readability.
 ggplot(richness_summary, aes(x = event_id, y = richness, fill = method)) +
@@ -276,3 +278,281 @@ ggplot(richness_summary, aes(x = event_id, y = richness, fill = method)) +
 2. Omission/Comission Analysis
 
 What to do about non-birds/ extremely unlikely birds (eg birds from Asia,Africa,etc) in Birdnet data. Should we filter first before running this analysis?
+Should the trusted species list be from all Point Counts and Human Listener files from each site or just the matching ones? Analyze it both ways and compare the two?
+
+Trusted Species List
+```{r Trusted Species List Creation}
+
+#Create trusted species list (only from the matched files)
+trusted_vectors_matched <- all_obs_PC_matches %>%
+  # keep only ARUxHuman and Point Count
+  filter(method %in% c("ARUxHuman", "Point Count")) %>%
+  # remove duplicates per site + species
+  distinct(site, species_id) %>%
+  # group by site and make a vector of species
+  group_by(site) %>%
+  summarise(trusted_species = list(species_id)) %>%
+  ungroup()
+
+# define confidence thresholds
+confidence_thresholds <- c(0.50, 0.60, 0.70, 0.80, 0.90)
+
+# filter BirdNet detections
+birdnet_PC_matches <- all_obs_PC_matches %>%
+  filter(method == "ARUxBirdNet")
+
+
+#Create Birdnet species list vectors for each confidence threshold
+birdnet_vectors_matched <- list()
+
+for(thresh in confidence_thresholds) {
+  birdnet_vectors_matched[[paste0("conf_", thresh*100)]] <- birdnet_PC_matches %>%
+    filter(confidence >= thresh) %>%
+    group_by(site) %>%
+    summarise(species_list = list(unique(species_id))) %>%
+    ungroup()
+}
+
+#Compare each confidence threshold with trusted list to create list of trusted species observed by Birdnet at each site
+commission_comparison_results <- list()
+
+for(thresh in confidence_thresholds) {
+  thresh_name <- paste0("conf_", thresh*100)
+  
+  commission_comparison_results[[thresh_name]] <- birdnet_vectors_matched[[thresh_name]] %>%
+    left_join(trusted_vectors_matched, by = "site") %>%
+    rowwise() %>%
+    mutate(
+      in_trusted = list(intersect(species_list, trusted_species)),
+      missing_from_birdnet = list(setdiff(trusted_species, species_list))
+    ) %>%
+    select(site, species_list, trusted_species, in_trusted, missing_from_birdnet) %>%
+    ungroup()
+}
+
+
+# Summary list to show number of trusted species counted, and number of trusted species omitted for each site 
+commission_comparison_summary <- list()
+
+for(thresh in confidence_thresholds) {
+  thresh_name <- paste0("conf_", thresh*100)
+  
+  commission_comparison_summary[[thresh_name]] <- commission_comparison_results[[thresh_name]] %>%
+    rowwise() %>%
+    summarise(
+      site = site,
+      confidence_threshold = thresh,
+      detected_trusted_count = length(in_trusted),
+      missing_trusted_count = length(missing_from_birdnet),
+      .groups = "drop"
+    )
+}
+
+# Combine all thresholds into a single table
+commission_comparison_summary_table <- bind_rows(commission_comparison_summary) %>%
+  arrange(site, confidence_threshold)
+
+#Line graph showing mean trusted species per site obersved by Birdnet at different confidence levels
+commission_comparison_summary_table %>%
+  group_by(confidence_threshold) %>%
+  summarise(mean_detected = mean(detected_trusted_count)) %>%
+  ggplot(aes(x = confidence_threshold, y = mean_detected)) +
+  geom_line(size = 1.2, color = "steelblue") +
+  geom_point(size = 3, color = "steelblue") +
+  scale_x_continuous(breaks = confidence_thresholds) +
+  labs(
+    title = "Mean Trusted Species Detected Across Sites",
+    x = "Confidence Threshold",
+    y = "Mean Detected Trusted Species"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
+Omission Analysis
+```{r Omission Probability}
+##Calculating Omission Probability for each method compared to the trusted species list
+
+#Long form of trusted species list for comparison
+trusted_species_long <- trusted_vectors_matched %>%
+  unnest(trusted_species) %>%          
+  rename(species_id = trusted_species) %>%
+  distinct(site, species_id)
+
+#Detections for Point Count & ARUxHuman
+human_detections <- all_obs_PC_matches %>%
+  filter(method %in% c("Point Count", "ARUxHuman"),
+         !is.na(species_id)) %>%
+  distinct(site, species_id, method)
+
+#Birdnet detections sorted by confidence intervals
+birdnet_list <- lapply(confidence_thresholds, function(thresh) {
+  all_obs_PC_matches %>%
+    filter(method == "ARUxBirdNet",
+           !is.na(species_id),
+           confidence >= thresh) %>%
+    distinct(site, species_id) %>%
+    mutate(method = paste0("ARUxBirdnet_", as.integer(thresh*100)))
+})
+
+birdnet_detections <- bind_rows(birdnet_list)
+
+# Combine all detections 
+all_detections <- bind_rows(human_detections, birdnet_detections)
+
+# omissions_denominatorr for ommission calculation: trusted species per site
+omissions_denominator <- trusted_species_long %>%
+  group_by(species_id) %>%
+  summarise(trusted_sites = n_distinct(site), .groups = "drop")
+
+# Numeratorr for omission calculation: number of trusted sites where each particular method detected each species 
+omissions_numerator <- all_detections %>%
+  inner_join(trusted_species_long, by = c("site", "species_id")) %>% 
+  group_by(species_id, method) %>%
+  summarise(detected_trusted_sites = n_distinct(site), .groups = "drop")
+
+# Make sure species-method combos with zero detections appear 
+methods_list <- c("Point Count", "ARUxHuman",
+                  paste0("ARUxBirdnet_", as.integer(confidence_thresholds*100)))
+
+all_combinations <- expand.grid(
+  species_id = omissions_denominator$species_id,
+  method = methods_list,
+  stringsAsFactors = FALSE
+)
+
+#Calculate Omission Probability
+#total method detections/total composite detections (from protocol) or 1 - (total method detections/total composite detections)? Should a species that is detected in both methods every time be a 1 or a 0?
+omission_prob_full <- all_combinations %>%
+  left_join(omissions_numerator, by = c("species_id", "method")) %>%
+  left_join(omissions_denominator, by = "species_id") %>%
+  mutate(detected_trusted_sites = tidyr::replace_na(detected_trusted_sites, 0),
+         omission_probability = 1 - (detected_trusted_sites / trusted_sites)) %>%
+  arrange(species_id, method)
+```
+
+Species specific Omission Analysis
+Looking for species specific trends in omission probability from the most common species.
+```{r}
+# Top 25 most frequent species in the trusted species list
+top25_species <- omissions_denominator %>%
+  arrange(desc(trusted_sites)) %>%
+  slice_head(n = 25) %>%
+  pull(species_id)
+
+# Subset of omission probability results 
+omission_top25 <- omission_prob_full %>%
+  filter(species_id %in% top25_species)
+
+# Reorder species to put most common on top for nicer plotting
+species_order <- omissions_denominator %>%
+  filter(species_id %in% top25_species) %>%
+  arrange(trusted_sites) %>%
+  pull(species_id)
+
+omission_top25$species_id <- factor(omission_top25$species_id,
+                                    levels = species_order)
+
+# Heat map of omission probability for 25 most common species for all 3 methods and all 5 Birdnet confidence levels
+ggplot(omission_top25,
+       aes(x = method, y = species_id, fill = omission_probability)) +
+  geom_tile(color = "white") +
+  scale_fill_viridis_c(limits = c(0,1), name = "Omission Prob.") +
+  labs(
+    title = "Omission Probability by Method for 25 Most Common Species",
+    x = "Method",
+    y = "Species"
+  ) +
+  theme_minimal(base_size = 14) +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        panel.grid = element_blank())
+```
+AMRO (American Robin) and WBNU (White-breasted Nuthatch) very often omitted at all confidences. Birdnet seemingly good at detecting RBNU, DUFL, STJA, TOSO. Interesting that TOSO (Townsend's Solitaire) is in same family as AMRO and RBNU (Red-breasted Nuthatch) and PYNU (Pygmy Nuthatch) same family as WBNU. At first glance does not seem that Birdnet consistently misses or accurately accounts for certain groups of birds, looks more species specific. 
+
+
+
+```{r}
+
+##Creating line graph of omission probability at difference confidence levels for common species
+# Adding confidence thresholds for Birdnet methods
+omission_line_data <- omission_top25 %>%
+  mutate(
+    threshold = ifelse(grepl("Birdnet_", method),
+                       as.numeric(sub("ARUxBirdnet_", "", method)) / 100,
+                       NA_real_),
+    method_type = ifelse(grepl("Birdnet", method),
+                         "ARUxBirdnet",
+                         method)
+  )
+
+# Create a flat line for non-BirdNET methods for comparison
+omission_line_data_expanded <- omission_line_data %>%
+  filter(!grepl("Birdnet", method)) %>%
+  select(-threshold) %>%  
+  tidyr::crossing(threshold = confidence_thresholds) %>%
+  mutate(method_type = method) %>%
+  bind_rows(
+    omission_line_data %>% filter(grepl("Birdnet", method))
+  )
+
+# Line plot showing change in omission probability over different confidence threshold for the most common species faceted by species
+ggplot(omission_line_data_expanded,
+       aes(x = threshold, y = omission_probability,
+           color = method_type, group = method)) +
+  geom_line(size = 1.2, na.rm = TRUE) +
+  geom_point(size = 2, na.rm = TRUE) +
+  facet_wrap(~ species_id, scales = "free_y", ncol = 5) +
+  scale_x_continuous(
+    breaks = threshold_levels,
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_y_continuous(limits = c(0,1)) +
+  labs(
+    title = "Omission Probability by Species and Method for Most Common Species",
+    x = "Confidence Threshold",
+    y = "Omission Probability",
+    color = "Method"
+  ) +
+  theme_minimal(base_size = 13) +
+  theme(panel.grid.minor = element_blank(),
+        strip.text = element_text(face = "bold"))
+```
+This graph is more readable with only the top 20 or fewer species, but I like the heatmap more with top 25 species.
+
+
+
+```{r}
+#Creating Line Graph for average omission probability at different Birdnet confidence thresholds for all species that are on the trsuted species list for 3 or more sites
+#filter to species in trusted list for >= 3 sites 
+species_3plus_sites <- omissions_denominator %>%
+  filter(trusted_sites >= 3) %>%
+  pull(species_id)
+
+#Calculate average omission probability
+birdnet_avg_omission <- omission_prob_full %>%
+  filter(species_id %in% species_3plus_sites,
+         grepl("Birdnet", method)) %>%
+  mutate(
+    threshold = as.numeric(sub("ARUxBirdnet_", "", method)) / 100
+  ) %>%
+  group_by(threshold) %>%
+  summarise(avg_omission = mean(omission_probability, na.rm = TRUE),
+            .groups = "drop")
+
+# Plot
+ggplot(birdnet_avg_omission,
+       aes(x = threshold, y = avg_omission)) +
+  geom_line(color = "steelblue", size = 1.2) +
+  geom_point(color = "steelblue", size = 3) +
+  scale_x_continuous(
+    breaks = c(0.5, 0.6, 0.7, 0.8, 0.9),
+    labels = scales::percent_format(accuracy = 1)
+  ) +
+  scale_y_continuous(limits = c(0, 1)) +
+  labs(
+    title = "Average Omission Probability for BirdNet (Species on ≥3 Sites)",
+    x = "Confidence Threshold",
+    y = "Average Omission Probability"
+  ) +
+  theme_minimal(base_size = 14)
+```
+
